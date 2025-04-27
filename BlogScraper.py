@@ -113,6 +113,7 @@ async def scrape_single_post(context, meta, idx, total_posts, semaphore):
             except PlaywrightTimeoutError:
                  print(f"  ⚠️ [{idx}/{total_posts}] iframe 또는 내부 콘텐츠 로딩 타임아웃.")
             except Exception as e:
+                 # iframe이 아예 없는 경우 등 오류 발생 가능
                  print(f"  ⚠️ [{idx}/{total_posts}] iframe 처리 중 오류: {e}")
 
 
@@ -161,7 +162,8 @@ async def scrape_single_post(context, meta, idx, total_posts, semaphore):
                 print(f"  ❌ [{idx}/{total_posts}] 모든 방법 실패: {meta['url']}")
                 data["content"] = "본문 내용 추출 실패"
                 try:
-                    screenshot_path = f'debug_post_{meta["logNo"]}.png'
+                    screenshot_path = f'debug_post_{meta["logNo"]}.png' # 로컬 저장 경로
+                    # Railway 같은 환경에서는 파일 시스템 쓰기가 제한될 수 있으므로 오류 처리
                     await p2.screenshot(path=screenshot_path, full_page=True)
                     print(f"  → [{idx}/{total_posts}] 디버깅 스크린샷 저장: {screenshot_path}")
                 except Exception as ss_err:
@@ -191,9 +193,11 @@ async def scrape_single_post(context, meta, idx, total_posts, semaphore):
 
 async def main():
     all_meta = []
-
     pw = None
     browser = None
+    # final_posts_data를 try 블록 전에 초기화
+    final_posts_data = []
+
     try:
         # --- Proxy Configuration Logic ---
         proxy_server_env = os.environ.get("PROXY_SERVER")
@@ -209,7 +213,6 @@ async def main():
                 "username": proxy_username_env,
                 "password": proxy_password_env
             }
-            # 필수 환경 변수 누락 시 경고 (선택적)
             if not proxy_username_env or not proxy_password_env:
                  print("⚠️ 경고: PROXY_USERNAME 또는 PROXY_PASSWORD 환경 변수가 없습니다.")
         else: # 환경 변수가 없으면 로컬로 간주하고 하드코딩된 값 사용
@@ -226,12 +229,12 @@ async def main():
              print("   - 프록시 사용 안 함.")
         # --- End of Proxy Configuration Logic ---
 
-
         pw      = await async_playwright().start()
+        # --- 클라우드 배포 시 headless=True로 변경 권장 ---
         browser = await pw.chromium.launch(
-            headless=False, # 클라우드에서는 True로 변경하는 것이 일반적
-            slow_mo=50,
-            proxy=proxy_config # 결정된 프록시 설정 전달
+            headless=True, # Railway 배포 시 True로 변경!
+            slow_mo=50,     # 배포 시 0 또는 제거 권장
+            proxy=proxy_config
         )
         context = await browser.new_context(
              viewport={"width":1280,"height":800},
@@ -239,12 +242,18 @@ async def main():
         )
         page    = await context.new_page()
 
-        # 1) 네이버 로그인
+        # --- 네이버 로그인 (수동 처리 부분 - 실제 서버에서는 다른 방식 필요) ---
+        # 실제 서버에서는 사용자가 직접 상호작용할 수 없으므로,
+        # 이 부분은 API 요청으로 ID/PW를 받거나, 미리 저장된 세션/쿠키를 사용하는 방식으로 변경해야 함.
+        # 여기서는 로컬 실행 시 수동 로그인을 가정.
         print("🔑 네이버 로그인 페이지 열기...")
         await page.goto(NAVER_LOGIN_URL, timeout=LONG_TO)
-        print("👉 로그인 완료될 때까지 기다립니다...")
+        print("👉 헤드리스 모드에서는 자동 로그인이 구현되어야 합니다.")
+        print("   (현재 코드는 수동 로그인을 가정하므로 클라우드 실행 시 이 부분에서 멈출 수 있습니다.)")
+        print("   (서버 환경에서는 ID/PW를 직접 입력하거나 쿠키/토큰을 사용하는 로직 필요)")
+        # 로그인 완료 대기 (URL 변경 감지)
         await page.wait_for_url(lambda url: NAVER_LOGIN_DOMAIN not in url and "naver.com" in url, timeout=LONG_TO)
-        print("✅ 로그인 성공.")
+        print("✅ 로그인 성공 (또는 로그인된 세션 감지됨).")
 
         # 2) blogId 추출
         print("📝 내 블로그로 이동하여 blogId 추출...")
@@ -258,7 +267,7 @@ async def main():
         blog_id = m.group(1)
         print(f"✅ blogId: {blog_id}")
 
-        # 3) 글 저장 페이지로 이동
+        # 3) 글 저장 페이지로 이동 (메타 정보 수집용)
         export_url = EXPORT_URL_TPL.format(blog_id)
         print(f"🔗 글 저장 페이지로 이동: {export_url}")
         await page.goto(export_url, timeout=LONG_TO)
@@ -271,12 +280,10 @@ async def main():
         if not frame: raise RuntimeError("❌ iframe.content_frame() 실패")
         print("✅ iframe 내부 프레임 획득 완료.")
 
-        # 5) 메타 정보 수집 함수 (내부 정의) - 날짜 선택자 수정됨
+        # 5) 메타 정보 수집 함수 (내부 정의)
         async def scrape_meta_page():
-            """한 페이지의 모든 포스트 메타 정보를 evaluate을 사용해 한 번에 스크래핑"""
             nonlocal all_meta, blog_id
             await asyncio.sleep(0.5)
-
             try:
                 page_meta_data = await frame.evaluate("""
                     (args) => {
@@ -286,7 +293,7 @@ async def main():
                         const data = [];
                         rows.forEach(row => {
                             const logno = row.getAttribute('logno');
-                            const dateEl = row.querySelector('td.tc span.num.add_date'); // 수정된 선택자
+                            const dateEl = row.querySelector('td.tc span.num.add_date');
                             const titleLink = row.querySelector('span.txt.title a');
                             let url = null;
                             if (titleLink) { url = titleLink.href; }
@@ -304,25 +311,14 @@ async def main():
 
                 print(f"  - 현재 페이지에서 {len(page_meta_data)}개의 행 데이터 발견 (evaluate)")
                 found_new = 0
-
                 for item in page_meta_data:
                     logno = item.get('logno')
                     date_str = item.get('date')
                     title = item.get('title', '제목 없음')
                     url = item.get('url')
-
-                    if not logno:
-                         print(f"    ⚠️ 행 데이터에 logNo 없음: {item}")
-                         continue
-
-                    if not date_str:
-                         print(f"    ⚠️ 행 {logno} 날짜 누락 (선택자: td.tc span.num.add_date)")
-                         date_str = "날짜 없음"
-
-                    if not url:
-                         print(f"    ⚠️ 행 {logno} URL 누락")
-                         url = f"https://blog.naver.com/{blog_id}/{logno}"
-
+                    if not logno: continue
+                    if not date_str: date_str = "날짜 없음"
+                    if not url: url = f"https://blog.naver.com/{blog_id}/{logno}"
                     if not any(p["logNo"] == logno for p in all_meta):
                         all_meta.append({"logNo": logno, "title": title, "url": url, "date": date_str})
                         print(f"    ✓ 수집: {logno} - {title[:30]}...")
@@ -330,10 +326,8 @@ async def main():
                         if MAX_POSTS_TO_COLLECT and len(all_meta) >= MAX_POSTS_TO_COLLECT:
                             print(f"🛑 수집 제한 도달: {MAX_POSTS_TO_COLLECT}개")
                             return True
-
                 print(f"  - 새로운 메타 {found_new}개 추가됨.")
                 return False
-
             except PlaywrightTimeoutError as te:
                 print(f"  ❌ evaluate 실행 중 타임아웃 발생: {te}")
                 return False
@@ -342,7 +336,7 @@ async def main():
                 traceback.print_exc()
                 return False
 
-        # — 메타 정보 스크래핑 시작 —
+        # — 메타 정보 스크래핑 시작 및 페이지네이션 —
         print("🚀 메타 정보 스크래핑 시작...")
         try:
             await frame.locator(POST_ROW_SELECTOR).first.wait_for(state="attached", timeout=MID_TO)
@@ -352,7 +346,6 @@ async def main():
 
         should_stop = await scrape_meta_page()
 
-        # 페이지네이션 처리
         if not should_stop:
             group = 1
             current_page = 1
@@ -360,7 +353,6 @@ async def main():
                 if MAX_POSTS_TO_COLLECT and len(all_meta) >= MAX_POSTS_TO_COLLECT:
                     print(f"🛑 수집 제한 도달로 페이지네이션 중단: {MAX_POSTS_TO_COLLECT}개")
                     break
-
                 page_numbers_texts = await frame.locator(PAGE_LINK_SELECTOR).all_inner_texts()
                 number_pages = []
                 for text in page_numbers_texts:
@@ -368,7 +360,6 @@ async def main():
                         page_num = int(text)
                         if page_num > current_page: number_pages.append(page_num)
                 number_pages.sort()
-
                 for page_num in number_pages:
                     if MAX_POSTS_TO_COLLECT and len(all_meta) >= MAX_POSTS_TO_COLLECT: break
                     print(f"➡️ 그룹{group} 페이지 {page_num} 스크래핑...")
@@ -380,14 +371,11 @@ async def main():
                         if should_stop: break
                     except Exception as e:
                         print(f"⚠️ 페이지 {page_num} 이동/처리 실패: {e}")
-
                 if should_stop or (MAX_POSTS_TO_COLLECT and len(all_meta) >= MAX_POSTS_TO_COLLECT): break
-
                 next_btn = frame.locator(NEXT_GROUP_SELECTOR)
                 if await next_btn.count() == 0:
                     print("🎉 모든 페이지 그룹 스크래핑 완료.")
                     break
-
                 print(f"➡️ 그룹 {group} 끝 → '다음' 클릭하여 다음 그룹 진입...")
                 try:
                     await next_btn.first.click()
@@ -402,7 +390,6 @@ async def main():
                 except Exception as e:
                     print(f"⚠️ '다음' 그룹 이동 또는 로딩 실패: {e}")
                     break
-
         print(f"\n📋 메타 총 {len(all_meta)}개 수집 완료.")
 
         # 6) 본문 내용 동시 스크래핑 및 저장
@@ -416,11 +403,10 @@ async def main():
             for idx, meta in enumerate(all_meta, start=1):
                 task = asyncio.create_task(scrape_single_post(context, meta, idx, total_posts, semaphore))
                 tasks.append(task)
-
             results = await asyncio.gather(*tasks, return_exceptions=True)
             print("\n✅ 모든 본문 스크래핑 작업 완료. 결과 처리 중...")
 
-            final_posts_data = []
+            # --- final_posts_data 리스트에 결과 저장 ---
             successful_count = 0
             failed_count = 0
             for i, result in enumerate(results):
@@ -429,9 +415,9 @@ async def main():
                     print(f"  - 심각한 오류 발생(gather): {result} - 연관 메타: {meta_info}")
                     failed_count += 1
                     error_data = {**meta_info, "content": f"스크래핑 작업 오류: {str(result)[:100]}"}
-                    final_posts_data.append(error_data)
+                    final_posts_data.append(error_data) # 실패 데이터도 포함
                 elif isinstance(result, dict):
-                    final_posts_data.append(result)
+                    final_posts_data.append(result) # 성공/실패 결과 dict 포함
                     if "추출 실패" in result.get("content", "") or "오류로 인한" in result.get("content", ""):
                         failed_count += 1
                     else: successful_count += 1
@@ -440,44 +426,57 @@ async def main():
                     failed_count += 1
                     unknown_data = {**meta_info, "content": "알 수 없는 결과 타입"}
                     final_posts_data.append(unknown_data)
-
             print(f"📊 스크래핑 결과: 성공 {successful_count}개, 실패 {failed_count}개")
 
-            # 7) 최종 데이터 저장
-            if use_replit_db:
-                print(f"💾 Replit DB에 {len(final_posts_data)}개 포스트 데이터 저장 시도...")
-                saved_count = 0
-                for post_data in final_posts_data:
-                    log_no = post_data.get("logNo")
-                    if not log_no or log_no == "N/A": continue
-                    try:
-                        db[log_no] = post_data
-                        saved_count += 1
-                    except Exception as db_err: print(f"  ⚠️ Replit DB 저장 오류 (logNo: {log_no}): {db_err}")
-                print(f"✅ Replit DB에 {saved_count}개 포스트 저장 완료.")
-            else:
+            # 7) 최종 데이터 저장 (선택적 - app.py가 결과를 받아 처리할 것이므로 주석 처리 가능)
+            if not use_replit_db: # 로컬 파일 저장은 로컬 테스트 시에만 의미 있음
                 output_filename = "blog_posts.json"
                 try:
                     with open(output_filename, "w", encoding="utf-8") as f:
                         json.dump(final_posts_data, f, ensure_ascii=False, indent=2)
-                    print(f"✅ {output_filename}에 {len(final_posts_data)}개 포스트 저장 완료.")
-                except IOError as io_err: print(f"❌ 로컬 파일 저장 실패 ({output_filename}): {io_err}")
+                    print(f"✅ (로컬 테스트용) {output_filename}에 {len(final_posts_data)}개 포스트 저장 완료.")
+                except IOError as io_err:
+                    print(f"❌ 로컬 파일 저장 실패 ({output_filename}): {io_err}")
+
+        # --- !!! 성공 시 반환 로직을 try 블록 끝으로 이동 !!! ---
+        print(f"BlogScraper.py: 총 {len(final_posts_data)}개 포스트 데이터 반환")
+        return final_posts_data # <--- 스크래핑 결과를 반환해야 함!
 
     except RuntimeError as err:
         print(f"💥 실행 중 오류: {err}"); traceback.print_exc()
+        return [] # 오류 시 빈 리스트 반환
     except PlaywrightError as pe:
         print(f"💥 Playwright 관련 오류 발생: {pe}"); traceback.print_exc()
+        return [] # 오류 시 빈 리스트 반환
     except Exception as e:
         print(f"💥 예상치 못한 치명적 오류 발생: {e}"); traceback.print_exc()
+        return [] # 오류 시 빈 리스트 반환
     finally:
-        print("🔄 스크래핑 프로세스 종료 중...")
-        if browser:
-            try: await browser.close(); print("  - 브라우저 닫힘.")
-            except Exception as close_err: print(f"  ⚠️ 브라우저 닫기 오류: {close_err}")
+        # --- finally 블록: 성공하든 실패하든 항상 실행됨 ---
+        print("🔄 스크래핑 리소스 정리 중...")
+        if browser and not browser.is_closed():
+            try:
+                await browser.close()
+                print("  - 브라우저 닫힘.")
+            except Exception as close_err:
+                print(f"  ⚠️ 브라우저 닫기 오류: {close_err}")
         if pw:
-            try: await pw.stop(); print("  - Playwright 프로세스 중지됨.")
-            except Exception as stop_err: print(f"  ⚠️ Playwright 중지 오류: {stop_err}")
-        print("🏁 스크래핑 종료.")
+            try:
+                await pw.stop()
+                print("  - Playwright 프로세스 중지됨.")
+            except Exception as stop_err:
+                 print(f"  ⚠️ Playwright 중지 오류: {stop_err}")
+        print("🏁 스크래핑 리소스 정리 완료.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # 이 파일이 직접 실행될 때 (테스트용)
+    print("스크립트 직접 실행 시작 (테스트 모드)")
+    results = asyncio.run(main())
+    print(f"\n스크립트 직접 실행 완료. 결과({len(results)}개 포스트) 확인.")
+    # 테스트 결과 간단히 출력
+    if results:
+        print("\n--- 수집된 포스트 (일부) ---")
+        for i, post in enumerate(results[:3]): # 처음 3개만 출력
+            print(f"  {i+1}. 제목: {post.get('title', 'N/A')[:30]}...")
+            print(f"     날짜: {post.get('date', 'N/A')}")
+            print(f"     내용: {post.get('content', '')[:50]}...")
