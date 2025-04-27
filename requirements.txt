@@ -1,0 +1,4 @@
+playwright
+Flask
+requests
+python-dotenv
