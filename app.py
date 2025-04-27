@@ -47,6 +47,12 @@ def run_scrape_task():
         scrape_status = "error"
         scrape_result_data = {"error": str(e)}
 
+# app.py 파일에 추가할 내용
+@app.route('/') # 루트 주소 ('/')로 GET 요청이 오면
+def home():
+    # 간단한 환영 메시지를 반환해요.
+    return "안녕하세요! 데이지 스크래퍼 서버가 작동 중입니다. 😊"
+
 # 외부(Replit)에서 스크래핑을 시작하라고 요청하는 주소
 @app.route('/scrape', methods=['POST'])
 def start_scraping():
